@@ -11,6 +11,7 @@ import android.view.Display
 import android.view.View
 import android.view.Window
 import android.view.WindowManager
+import android.widget.ImageView
 import android.widget.TextView
 import androidx.core.content.ContextCompat
 import androidx.core.view.isInvisible
@@ -63,6 +64,8 @@ class PresentationHandler(context: Context, display: Display?): Presentation(con
         val pixelfont = resources.getFont(R.font.dogica)
         Globals.visualbar = visual
         Globals.visualsquare = visualSquare
+        Globals.albumArtView = findViewById(R.id.albumArtView)
+        Globals.presentationRoot = findViewById(R.id.presentationRoot)
 
         val clockView = Globals.timefield
         val dateView = Globals.datefield
@@ -108,8 +111,8 @@ class PresentationHandler(context: Context, display: Display?): Presentation(con
                 visualSquare.setPlayer(0)
                 visualSquare.setDensity(12F)
                 Globals.visual = 2
-            } catch (e: SecurityException) {
-                Log.e("S22PresHandlerInit", "SecurityException initializing visualizer", e)
+            } catch (e: Exception) {
+                Log.e("S22PresHandlerInit", "Failed to initialize square visualizer", e)
             }
         }
         fun barvis()
@@ -124,8 +127,8 @@ class PresentationHandler(context: Context, display: Display?): Presentation(con
                 visual.setPlayer(0)
                 visual.setDensity(20F)
                 Globals.visual = 1
-            } catch (e: SecurityException) {
-                Log.e("S22PresHandlerInit", "SecurityException initializing visualizer", e)
+            } catch (e: Exception) {
+                Log.e("S22PresHandlerInit", "Failed to initialize bar visualizer", e)
             }
         }
         if(Globals.style == 1)

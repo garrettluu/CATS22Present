@@ -13,6 +13,10 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.display.DisplayManager
+import android.graphics.Bitmap
+import android.media.MediaMetadata
+import android.media.session.MediaController
+import android.media.session.MediaSessionManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -23,6 +27,7 @@ import android.service.notification.StatusBarNotification
 import android.telephony.TelephonyManager
 import android.util.Log
 import android.view.Display
+import android.view.View
 import androidx.core.view.isInvisible
 import com.topjohnwu.superuser.ipc.RootService
 
@@ -64,6 +69,7 @@ class ListenerService : Service()
     private val wakeTimeoutRunnable = Runnable {
         wakeSessionActive = false
         Log.v("S22PresListServ", "Wake timeout, putting device to sleep")
+        Globals.presentationRoot?.visibility = View.INVISIBLE
         sendToRoot(Message.obtain(null, ScreenService.CMD_SECONDARY_OFF, 0, 0))
     }
     val RootConnect = object : ServiceConnection
@@ -109,6 +115,7 @@ class ListenerService : Service()
             Log.v("S22PresListServ", "Wake display requested")
             wakeSessionActive = true
             wakeTimeoutHandler.removeCallbacks(wakeTimeoutRunnable)
+            Globals.presentationRoot?.visibility = View.VISIBLE
             sendToRoot(Message.obtain(null, ScreenService.CMD_SECONDARY_WAKE, 0, 0))
             wakeTimeoutHandler.postDelayed(
                 wakeTimeoutRunnable, DISPLAY_WAKE_LATENCY_MS + Globals.wakeTimeoutMs
@@ -167,6 +174,7 @@ class ListenerService : Service()
                     Log.v("S22PresListServ", "Lid closed, waking secondary briefly")
                     wakeSessionActive = true
                     wakeTimeoutHandler.removeCallbacks(wakeTimeoutRunnable)
+                    Globals.presentationRoot?.visibility = View.VISIBLE
                     sendToRoot(Message.obtain(null, ScreenService.CMD_SECONDARY_WAKE, 0, 0))
                     wakeTimeoutHandler.postDelayed(
                         wakeTimeoutRunnable, DISPLAY_WAKE_LATENCY_MS + Globals.wakeTimeoutMs
@@ -177,6 +185,7 @@ class ListenerService : Service()
                     Log.v("S22PresListServ", "Notification received with lid closed, waking secondary")
                     wakeSessionActive = true
                     wakeTimeoutHandler.removeCallbacks(wakeTimeoutRunnable)
+                    Globals.presentationRoot?.visibility = View.VISIBLE
                     sendToRoot(Message.obtain(null, ScreenService.CMD_SECONDARY_WAKE, 0, 0))
                     wakeTimeoutHandler.postDelayed(
                         wakeTimeoutRunnable, DISPLAY_WAKE_LATENCY_MS + Globals.wakeTimeoutMs
@@ -195,6 +204,7 @@ class ListenerService : Service()
                     mainHandler.postDelayed(
                         {
                             Log.v("S22PresListServ", "Action requiring screen off detected")
+                            Globals.presentationRoot?.visibility = View.INVISIBLE
                             sendToRoot(request)
                         }, 500)
                 }
@@ -305,6 +315,8 @@ class NotificationService : NotificationListenerService() {
     var musicactive=false
     var musicnotiftitle:String = ""
     var musicnotiftext:String = ""
+    private var activeController: MediaController? = null
+    private var mediaCallback: MediaController.Callback? = null
     // When listener created.
     override fun onCreate() {
         // Log.
@@ -312,13 +324,55 @@ class NotificationService : NotificationListenerService() {
         super.onCreate()
     }
 
+    private fun setAlbumArtFromMetadata(metadata: MediaMetadata?) {
+        val art: Bitmap? = metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+            ?: metadata?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+            ?: metadata?.description?.iconBitmap
+        if (art != null) {
+            Globals.albumArtView?.setImageBitmap(art)
+            Globals.albumArtView?.visibility = View.VISIBLE
+        } else {
+            Globals.albumArtView?.visibility = View.GONE
+        }
+    }
+
+    private fun updateAlbumArt(packageName: String) {
+        mediaCallback?.let { activeController?.unregisterCallback(it) }
+        try {
+            val msm = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+            val component = ComponentName(this, NotificationService::class.java)
+            val controllers = msm.getActiveSessions(component)
+            val controller = controllers.firstOrNull { it.packageName == packageName }
+                ?: return
+            activeController = controller
+            setAlbumArtFromMetadata(controller.metadata)
+            val callback = object : MediaController.Callback() {
+                override fun onMetadataChanged(metadata: MediaMetadata?) {
+                    setAlbumArtFromMetadata(metadata)
+                }
+            }
+            mediaCallback = callback
+            controller.registerCallback(callback)
+        } catch (e: Exception) {
+            Log.w("S22PresNotifServ", "Failed to get album art", e)
+        }
+    }
+
+    private fun clearAlbumArt() {
+        mediaCallback?.let { activeController?.unregisterCallback(it) }
+        mediaCallback = null
+        activeController = null
+        Globals.albumArtView?.setImageBitmap(null)
+        Globals.albumArtView?.visibility = View.GONE
+    }
+
     // When Notification created.
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         // Store information in variables
         val packageName = sbn.packageName
         val extras = sbn.notification.extras
-        val title = extras.getString("android.title")
-        val text = extras.getString("android.text")
+        val title = extras.getCharSequence("android.title")?.toString()
+        val text = extras.getCharSequence("android.text")?.toString()
         if(title != null || text != null) {
             if (Globals.titlefield.text == "") {
                 ObjectAnimator.ofFloat(Globals.datefield, "translationY", -20f)
@@ -342,6 +396,7 @@ class NotificationService : NotificationListenerService() {
                         1->{Globals.visualbar.isInvisible = false}
                         2->{Globals.visualsquare.isInvisible = false}
                     }
+                    updateAlbumArt(packageName)
                 }
                 Globals.titlefield.text = title
                 Intent().also { broadcast ->
@@ -357,8 +412,8 @@ class NotificationService : NotificationListenerService() {
     }
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
         Log.v("S22PresNotifServ", "Something got removed.")
-            val title = sbn?.notification?.extras?.getString("android.title")
-            val text = sbn?.notification?.extras?.getString("android.text")
+            val title = sbn?.notification?.extras?.getCharSequence("android.title")?.toString()
+            val text = sbn?.notification?.extras?.getCharSequence("android.text")?.toString()
             if(Globals.titlefield.text == title && Globals.contentfield.text == text)
             {
                 Log.v("S22PresNotifServ", "Clearing display.")
@@ -386,6 +441,7 @@ class NotificationService : NotificationListenerService() {
                 1->{Globals.visualbar.isInvisible = true}
                 2->{Globals.visualsquare.isInvisible = true}
             }
+            clearAlbumArt()
             musicactive=false
             musicnotiftitle=""
             musicnotiftext=""

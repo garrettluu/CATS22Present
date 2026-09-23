@@ -5,6 +5,8 @@ import android.content.Context
 import android.os.IBinder
 import android.util.Log
 import android.view.SurfaceControl
+import android.view.View
+import android.widget.ImageView
 import android.widget.TextView
 import com.chibde.visualizer.BarVisualizer
 import com.chibde.visualizer.SquareBarVisualizer
@@ -59,6 +61,8 @@ class Globals
         var visual : Int = 0
         lateinit var visualbar: BarVisualizer
         lateinit var visualsquare: SquareBarVisualizer
+        var albumArtView: ImageView? = null
+        var presentationRoot: View? = null
         var style = 0
         var font = 0
         var wakeTimeoutMs = 3000L
