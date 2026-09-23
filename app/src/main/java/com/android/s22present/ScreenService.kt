@@ -20,6 +20,7 @@ class ScreenService : RootService()
         const val CMD_MAIN_OFF = 2
         const val CMD_SECONDARY_WAKE = 3
         const val CMD_START_HALL_MONITOR = 4
+        const val CMD_MAIN_ON = 5
 
         const val MSG_LID_OPEN = 100
         const val MSG_LID_CLOSED = 101
@@ -41,6 +42,7 @@ class ScreenService : RootService()
         }
 
         private var hallMonitorThread: Thread? = null
+        private var wakeFollowUpRunnable: Runnable? = null
 
         private fun startHallMonitor(replyTo: Messenger) {
             hallMonitorThread?.interrupt()
@@ -113,7 +115,14 @@ class ScreenService : RootService()
                         setDisplayPowerMode.invoke(
                             null, Globals.token as IBinder?, powerModeNormal
                         )
-                        postDelayed({
+                        wakeFollowUpRunnable?.let { removeCallbacks(it) }
+                        val followUp = Runnable {
+                            val hallState = File(HALL_STATE_PATH)
+                            val lidClosed = hallState.exists() && hallState.readText().trim() == "0"
+                            if (!lidClosed) {
+                                Log.v("S22PresScreenServ", "Wake follow-up skipped, lid is open")
+                                return@Runnable
+                            }
                             writeBacklight(MAIN_BACKLIGHT, 0)
                             try {
                                 setDisplayPowerMode.invoke(
@@ -128,16 +137,24 @@ class ScreenService : RootService()
                                     "Failed to set display power after wake", e
                                 )
                             }
-                        }, 1000)
+                        }
+                        wakeFollowUpRunnable = followUp
+                        postDelayed(followUp, 1000)
                         Log.v("S22PresScreenServ", "Secondary display wake")
                     }
                     CMD_SECONDARY_OFF -> {
+                        wakeFollowUpRunnable?.let { removeCallbacks(it) }
+                        wakeFollowUpRunnable = null
                         setDisplayPowerMode.invoke(null, Globals.token as IBinder?, powerModeOff)
                         Log.v("S22PresScreenServ", "Secondary display off")
                     }
                     CMD_MAIN_OFF -> {
                         setDisplayPowerMode.invoke(null, Globals.token1 as IBinder?, powerModeOff)
                         Log.v("S22PresScreenServ", "Main display off")
+                    }
+                    CMD_MAIN_ON -> {
+                        setDisplayPowerMode.invoke(null, Globals.token1 as IBinder?, powerModeNormal)
+                        Log.v("S22PresScreenServ", "Main display on")
                     }
                 }
             } catch (e: ReflectiveOperationException) {
