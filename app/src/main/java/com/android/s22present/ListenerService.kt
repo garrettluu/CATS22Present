@@ -17,6 +17,7 @@ import android.graphics.Bitmap
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
+import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -315,6 +316,7 @@ class NotificationService : NotificationListenerService() {
     var musicactive=false
     var musicnotiftitle:String = ""
     var musicnotiftext:String = ""
+    var musicnotifpkg:String = ""
     private var activeController: MediaController? = null
     private var mediaCallback: MediaController.Callback? = null
     // When listener created.
@@ -350,6 +352,16 @@ class NotificationService : NotificationListenerService() {
                 override fun onMetadataChanged(metadata: MediaMetadata?) {
                     setAlbumArtFromMetadata(metadata)
                 }
+                override fun onPlaybackStateChanged(state: PlaybackState?) {
+                    when (state?.state) {
+                        PlaybackState.STATE_STOPPED, PlaybackState.STATE_NONE -> {
+                            clearMusicState()
+                        }
+                    }
+                }
+                override fun onSessionDestroyed() {
+                    clearMusicState()
+                }
             }
             mediaCallback = callback
             controller.registerCallback(callback)
@@ -364,6 +376,19 @@ class NotificationService : NotificationListenerService() {
         activeController = null
         Globals.albumArtView?.setImageBitmap(null)
         Globals.albumArtView?.visibility = View.GONE
+    }
+
+    private fun clearMusicState() {
+        Log.v("S22PresNotifServ", "Clearing music")
+        when(Globals.visual) {
+            1 -> { Globals.visualbar.isInvisible = true }
+            2 -> { Globals.visualsquare.isInvisible = true }
+        }
+        clearAlbumArt()
+        musicactive = false
+        musicnotiftitle = ""
+        musicnotiftext = ""
+        musicnotifpkg = ""
     }
 
     // When Notification created.
@@ -391,6 +416,7 @@ class NotificationService : NotificationListenerService() {
                     musicactive = true
                     musicnotiftitle = title ?: ""
                     musicnotiftext = text ?: ""
+                    musicnotifpkg = packageName
                     when(Globals.visual)
                     {
                         1->{Globals.visualbar.isInvisible = false}
@@ -411,9 +437,10 @@ class NotificationService : NotificationListenerService() {
         }
     }
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
-        Log.v("S22PresNotifServ", "Something got removed.")
+        Log.v("S22PresNotifServ", "Something got removed. pkg=${sbn?.packageName}")
             val title = sbn?.notification?.extras?.getCharSequence("android.title")?.toString()
             val text = sbn?.notification?.extras?.getCharSequence("android.text")?.toString()
+            Log.v("S22PresNotifServ", "removed title='$title' musicnotiftitle='$musicnotiftitle' musicactive=$musicactive")
             if(Globals.titlefield.text == title && Globals.contentfield.text == text)
             {
                 Log.v("S22PresNotifServ", "Clearing display.")
@@ -433,18 +460,9 @@ class NotificationService : NotificationListenerService() {
                     ObjectAnimator.ofFloat(Globals.contentfield, "translationY", 20f).apply { duration = 500; start() }
                 }
             }
-        if(musicactive && title==musicnotiftitle)
+        if(musicactive && (title == musicnotiftitle || sbn?.packageName == musicnotifpkg))
         {
-            Log.v("S22PresNotifServ", "Clearing music")
-            when(Globals.visual)
-            {
-                1->{Globals.visualbar.isInvisible = true}
-                2->{Globals.visualsquare.isInvisible = true}
-            }
-            clearAlbumArt()
-            musicactive=false
-            musicnotiftitle=""
-            musicnotiftext=""
+            clearMusicState()
         }
         super.onNotificationRemoved(sbn)
         }
