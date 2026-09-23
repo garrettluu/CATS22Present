@@ -40,6 +40,26 @@ class ListenerService : Service()
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lidClosedRunnable: Runnable? = null
     private var lidOpenRunnable: Runnable? = null
+    private var mainDisplay: Display? = null
+    private val lidHandler = object : Handler(Looper.getMainLooper()) {
+        override fun handleMessage(msg: Message) {
+            when (msg.what) {
+                ScreenService.MSG_LID_CLOSED -> {
+                    Log.v("S22PresListServ", "Hall sensor: lid closed")
+                    sendBroadcast(Intent("com.android.s22present.LIDCLOSED"))
+                }
+                ScreenService.MSG_LID_OPEN -> {
+                    Log.v("S22PresListServ", "Hall sensor: lid open")
+                    sendBroadcast(Intent("com.android.s22present.LIDOPEN"))
+                }
+                ScreenService.MSG_HALL_NOT_FOUND -> {
+                    Log.w("S22PresListServ", "No hall sensor, using proximity fallback")
+                    mainDisplay?.let { registerProximitySensor(it) }
+                }
+            }
+        }
+    }
+    private val lidMessenger = Messenger(lidHandler)
     private val wakeTimeoutHandler = Handler(Looper.getMainLooper())
     private val wakeTimeoutRunnable = Runnable {
         wakeSessionActive = false
@@ -58,6 +78,9 @@ class ListenerService : Service()
                         Globals.statusText?.text = "Running \u2713"
                         Globals.onRootStatusChanged?.invoke()
                         Log.i("S22PresScreenServInit", "Done!")
+                        val hallMsg = Message.obtain(null, ScreenService.CMD_START_HALL_MONITOR)
+                        hallMsg.replyTo = lidMessenger
+                        rootservice?.send(hallMsg)
             } else {
                 Globals.rootAvailable = false
                 Globals.statusText?.text = "Not running \u2717"
@@ -97,6 +120,7 @@ class ListenerService : Service()
         Log.i("S22PresListServInit", "Hello!")
         val displaymanager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         val display0 = displaymanager.displays[0]
+        mainDisplay = display0
         val presentationDisplays = displaymanager.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)
         val display1 = presentationDisplays.firstOrNull() ?: displaymanager.displays.getOrNull(1)
         if (display1 == null) {
@@ -170,50 +194,6 @@ class ListenerService : Service()
                 }
             }
         }
-        val sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        val proximitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
-
-        val proximitySensorEventListener: SensorEventListener = object : SensorEventListener {
-            override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) {}
-            override fun onSensorChanged(event: SensorEvent)
-            {
-                if (event.sensor.type == Sensor.TYPE_PROXIMITY) {
-                    // Cancel any pending lid callbacks to prevent race conditions
-                    // from rapid open/close sequences
-                    lidClosedRunnable?.let { mainHandler.removeCallbacks(it) }
-                    lidOpenRunnable?.let { mainHandler.removeCallbacks(it) }
-
-                    if (event.values[0] == 0f)
-                    {
-                        val runnable = Runnable {
-                            if (display0!!.state == Display.STATE_OFF)
-                            {
-                                Log.v("S22PresSensList", "Shut")
-                                Intent().also { broadcast -> broadcast.setAction("com.android.s22present.LIDCLOSED")
-                                    sendBroadcast(broadcast) }
-                            }
-                        }
-                        lidClosedRunnable = runnable
-                        mainHandler.postDelayed(runnable, 1500)
-                    }
-                    else
-                    {
-                        val runnable = Runnable {
-                            if (display0!!.state == Display.STATE_ON)
-                            {
-                                Log.v("S22PresSensList", "Open")
-                                Intent().also { broadcast -> broadcast.setAction("com.android.s22present.LIDOPEN")
-                                    sendBroadcast(broadcast)
-                                }
-                            }
-                        }
-                        lidOpenRunnable = runnable
-                        mainHandler.postDelayed(runnable, 400)
-                    }
-                }
-            }
-        }
-        sensorManager.registerListener(proximitySensorEventListener, proximitySensor, SensorManager.SENSOR_DELAY_FASTEST)
         // Create a filter for the Broadcast Receiver
         val screenStateFilter = IntentFilter()
         // Add various actions to it.
@@ -234,6 +214,47 @@ class ListenerService : Service()
     override fun onBind(intent: Intent?): IBinder? {
       return null
     }
+    private fun registerProximitySensor(display0: Display) {
+        val sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        val proximitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
+        val proximitySensorEventListener: SensorEventListener = object : SensorEventListener {
+            override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) {}
+            override fun onSensorChanged(event: SensorEvent) {
+                if (event.sensor.type == Sensor.TYPE_PROXIMITY) {
+                    lidClosedRunnable?.let { mainHandler.removeCallbacks(it) }
+                    lidOpenRunnable?.let { mainHandler.removeCallbacks(it) }
+                    if (event.values[0] == 0f) {
+                        val runnable = Runnable {
+                            if (display0.state == Display.STATE_OFF) {
+                                Log.v("S22PresSensList", "Shut")
+                                Intent().also { broadcast ->
+                                    broadcast.setAction("com.android.s22present.LIDCLOSED")
+                                    sendBroadcast(broadcast)
+                                }
+                            }
+                        }
+                        lidClosedRunnable = runnable
+                        mainHandler.postDelayed(runnable, 1500)
+                    } else {
+                        val runnable = Runnable {
+                            if (display0.state == Display.STATE_ON) {
+                                Log.v("S22PresSensList", "Open")
+                                Intent().also { broadcast ->
+                                    broadcast.setAction("com.android.s22present.LIDOPEN")
+                                    sendBroadcast(broadcast)
+                                }
+                            }
+                        }
+                        lidOpenRunnable = runnable
+                        mainHandler.postDelayed(runnable, 400)
+                    }
+                }
+            }
+        }
+        sensorManager.registerListener(proximitySensorEventListener, proximitySensor, SensorManager.SENSOR_DELAY_FASTEST)
+        Log.i("S22PresListServInit", "Proximity sensor registered as lid fallback")
+    }
+
     private fun sendToRoot(msg: Message) {
         val service = rootservice
         if (service == null) {
