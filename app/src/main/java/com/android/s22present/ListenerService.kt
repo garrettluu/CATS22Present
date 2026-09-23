@@ -164,6 +164,16 @@ class ListenerService : Service()
                 {
                     lid = "closed"
                 }
+                if (intent.action == "com.android.s22present.NOTIFICATION_RECEIVED" && lid == "closed")
+                {
+                    Log.v("S22PresListServ", "Notification received with lid closed, waking secondary")
+                    wakeSessionActive = true
+                    wakeTimeoutHandler.removeCallbacks(wakeTimeoutRunnable)
+                    sendToRoot(Message.obtain(null, ScreenService.CMD_SECONDARY_WAKE, 0, 0))
+                    wakeTimeoutHandler.postDelayed(
+                        wakeTimeoutRunnable, DISPLAY_WAKE_LATENCY_MS + Globals.wakeTimeoutMs
+                    )
+                }
                 if(intent.action == Intent.ACTION_SCREEN_ON && !wakeSessionActive)
                 {
                       turnoff()
