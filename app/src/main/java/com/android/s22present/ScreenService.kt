@@ -1,5 +1,6 @@
 package com.android.s22present
 
+import android.content.Context
 import android.content.Intent
 import android.os.Handler
 import android.os.HandlerThread
@@ -7,6 +8,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.Message
 import android.os.Messenger
+import android.os.PowerManager
 import android.os.RemoteException
 import android.os.SystemClock
 import android.util.Log
@@ -32,21 +34,31 @@ class ScreenService : RootService()
         const val MSG_HALL_NOT_FOUND = 102
         const val MSG_SECONDARY_STATE = 103 // arg1 = 1 if the presentation should be visible
 
-        private val controller: DisplayController by lazy {
+        private var controller: DisplayController? = null
+
+        @Synchronized
+        private fun controller(context: Context): DisplayController = controller ?: run {
             val thread = HandlerThread("display-controller").apply { start() }
-            DisplayController(thread).also { LidMonitor(it).start() }
+            DisplayController(thread, context).also {
+                controller = it
+                LidMonitor(it).start()
+            }
         }
     }
 
     override fun onBind(intent: Intent): IBinder
     {
         Log.i("S22PresScreenServInit", "Hello! I've been bound :3")
-        return Messenger(controller).binder
+        return Messenger(controller(this)).binder
     }
 }
 
-// Single owner of secondary display power. All state is confined to its HandlerThread.
-internal class DisplayController(thread: HandlerThread) : Handler(thread.looper) {
+// Single owner of display power changes driven by the lid. All state is confined to its HandlerThread.
+// When TrebleLidHook has disabled TrebleApp's lid handling, this also sleeps/wakes Android.
+internal class DisplayController(
+    thread: HandlerThread,
+    private val context: Context,
+) : Handler(thread.looper) {
 
     companion object {
         private const val TAG = "S22PresDisplayCtl"
@@ -54,11 +66,21 @@ internal class DisplayController(thread: HandlerThread) : Handler(thread.looper)
         private const val MIN_GAP_MS = 1500L
         // Lets the app hide the presentation before the panel stops consuming frames.
         private const val HIDE_LEAD_MS = 50L
+        // How often the blanked backlight is re-checked while a power-off waits on the gap.
+        private const val BLANK_RECHECK_MS = 150L
         // Panel power-on time, added so the wake timeout counts visible time.
         private const val WAKE_LATENCY_MS = 1000L
         private const val UNKNOWN = -1
         private const val POWER_OFF = 0
         private const val POWER_ON = 2
+        private const val SECONDARY_BACKLIGHT = "/sys/class/leds/lcd-backlight2/brightness"
+        // Written by TrebleLidHook; the settings provider isn't reachable from the root process.
+        // Read via init's root: this process inherits the app's mount namespace, where app data
+        // isolation hides other apps' /data/user_de directories.
+        private const val TREBLE_HOOK_MARKER =
+            "/proc/1/root/data/user_de/0/me.phh.treble.app/files/s22present_lid_hook"
+        private const val BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+        private const val WAKE_REASON_APPLICATION = 2
     }
 
     private var client: Messenger? = null
@@ -69,12 +91,26 @@ internal class DisplayController(thread: HandlerThread) : Handler(thread.looper)
     private var lastChangeAt = Long.MIN_VALUE / 2
     private var notifiedVisible: Boolean? = null
     private var hallMissing = false
+    private var openWakePending = false
+    private var trebleHooked = false
+    // Secondary backlight value saved while blanked; restored before the panel is shown again.
+    private var blankedBacklight: String? = null
 
     private val reconcileRunnable = Runnable { reconcile() }
+
+    private val powerManager = context.getSystemService(PowerManager::class.java)
 
     private val setDisplayPowerMode by lazy {
         SurfaceControl::class.java.getMethod(
             "setDisplayPowerMode", IBinder::class.java, Int::class.java
+        )
+    }
+    private val goToSleepMethod by lazy {
+        PowerManager::class.java.getMethod("goToSleep", Long::class.javaPrimitiveType)
+    }
+    private val wakeUpMethod by lazy {
+        PowerManager::class.java.getMethod(
+            "wakeUp", Long::class.javaPrimitiveType, Int::class.javaPrimitiveType, String::class.java
         )
     }
 
@@ -84,13 +120,14 @@ internal class DisplayController(thread: HandlerThread) : Handler(thread.looper)
                 client = msg.replyTo
                 if (msg.arg1 > 0) wakeTimeoutMs = msg.arg1.toLong()
                 notifiedVisible = null
-                Log.i(TAG, "Client registered, wakeTimeout=${wakeTimeoutMs}ms lidClosed=$lidClosed")
+                Log.i(TAG, "Client registered, wakeTimeout=${wakeTimeoutMs}ms lidClosed=$lidClosed " +
+                    "trebleHooked=${isTrebleHooked()}")
                 if (hallMissing) send(ScreenService.MSG_HALL_NOT_FOUND)
                 notifyVisible(desiredOn())
             }
             ScreenService.CMD_WAKE -> {
                 if (lidClosed == true) {
-                    wakeUntil = SystemClock.uptimeMillis() + WAKE_LATENCY_MS + wakeTimeoutMs
+                    wakeUntil = maxOf(wakeUntil, SystemClock.uptimeMillis() + WAKE_LATENCY_MS + wakeTimeoutMs)
                     reconcile()
                 }
             }
@@ -110,16 +147,21 @@ internal class DisplayController(thread: HandlerThread) : Handler(thread.looper)
         if (Looper.myLooper() != looper) { post { onLid(closed) }; return }
         if (lidClosed == closed) return
         lidClosed = closed
-        Log.v(TAG, "Lid ${if (closed) "closed" else "open"}")
+        val hooked = isTrebleHooked()
+        Log.v(TAG, "Lid ${if (closed) "closed" else "open"} (trebleHooked=$hooked)")
         send(if (closed) ScreenService.MSG_LID_CLOSED else ScreenService.MSG_LID_OPEN)
         val now = SystemClock.uptimeMillis()
         if (closed) {
             wakeUntil = now + WAKE_LATENCY_MS + wakeTimeoutMs
-            // Android puts the display group to sleep ~100ms after the lid closes; waking
-            // immediately would be cut off by that, which is the pattern that wedges the panel.
-            lastChangeAt = maxOf(lastChangeAt, now)
+            openWakePending = false
+            // Unhooked, TrebleApp sleeps Android ~100ms after close; waking immediately would be
+            // cut off by that, which is the pattern that wedges the panel.
+            if (!hooked) lastChangeAt = maxOf(lastChangeAt, now)
         } else {
             wakeUntil = 0L
+            // Unhooked, TrebleApp wakes Android too; a second wakeUp is a no-op, and doing it
+            // regardless means a missed hook marker can't leave the phone asleep on open.
+            openWakePending = true
         }
         reconcile()
     }
@@ -132,11 +174,15 @@ internal class DisplayController(thread: HandlerThread) : Handler(thread.looper)
     // Android changed the secondary's power itself (wake/sleep of the shared display group).
     private fun onAndroidSecondaryState(on: Boolean) {
         Log.v(TAG, "Android set secondary ${if (on) "ON" else "OFF"}")
+        val now = SystemClock.uptimeMillis()
         // Android sleeping while we're showing the secondary (power button, screen timeout)
         // ends the wake; its sleep on lid close happens before our wake is applied, so keep that.
         if (!on && applied == POWER_ON) wakeUntil = 0L
+        // Woken some other way with the lid closed (power button, call): show the outer screen
+        // for a wake period rather than sleeping straight away.
+        if (on && lidClosed == true) wakeUntil = maxOf(wakeUntil, now + WAKE_LATENCY_MS + wakeTimeoutMs)
         applied = if (on) POWER_ON else POWER_OFF
-        lastChangeAt = SystemClock.uptimeMillis()
+        lastChangeAt = now
         reconcile()
     }
 
@@ -146,24 +192,73 @@ internal class DisplayController(thread: HandlerThread) : Handler(thread.looper)
     private fun reconcile() {
         removeCallbacks(reconcileRunnable)
         val now = SystemClock.uptimeMillis()
+        val interactive = powerManager.isInteractive
         val wantOn = desiredOn()
-        val want = if (wantOn) POWER_ON else POWER_OFF
+        val gapWait = lastChangeAt + MIN_GAP_MS - now
 
+        // Showing the secondary needs Android awake (SurfaceFlinger composes only then); when hooked,
+        // opening the lid wakes Android too. Waking powers the whole display group on.
+        if (!interactive && (wantOn || openWakePending)) {
+            if (gapWait > 0) { postDelayed(reconcileRunnable, gapWait); return }
+            openWakePending = false
+            if (wantOn) wakeUntil = maxOf(wakeUntil, now + WAKE_LATENCY_MS + wakeTimeoutMs)
+            notifyVisible(wantOn)
+            restoreBacklight()
+            wakeUp()
+            applied = POWER_ON
+            lastChangeAt = now
+            postDelayed(reconcileRunnable, MIN_GAP_MS)
+            return
+        }
+        if (interactive) openWakePending = false
+
+        // Lid closed with nothing to show: sleep Android, turning both displays off in one change.
+        if (interactive && lidClosed == true && !wantOn) {
+            if (applied != POWER_OFF) {
+                if (gapWait > 0) {
+                    blankBacklight()
+                    postDelayed(reconcileRunnable, minOf(gapWait, BLANK_RECHECK_MS))
+                    return
+                }
+                if (notifiedVisible != false) {
+                    notifyVisible(false)
+                    postDelayed(reconcileRunnable, HIDE_LEAD_MS)
+                    return
+                }
+                applied = POWER_OFF
+                lastChangeAt = now
+            }
+            goToSleep()
+            return
+        }
+
+        if (!interactive) {
+            notifyVisible(false)
+            return
+        }
+
+        // Android awake: control the secondary panel directly.
+        val want = if (wantOn) POWER_ON else POWER_OFF
         if (applied == want) {
             notifyVisible(wantOn)
             scheduleWakeExpiry(now)
             return
         }
-        val wait = lastChangeAt + MIN_GAP_MS - now
-        if (wait > 0) {
-            postDelayed(reconcileRunnable, wait)
+        if (gapWait > 0) {
+            if (!wantOn) {
+                notifyVisible(false)
+                blankBacklight()
+                postDelayed(reconcileRunnable, minOf(gapWait, BLANK_RECHECK_MS))
+            } else {
+                postDelayed(reconcileRunnable, gapWait)
+            }
             return
         }
         if (wantOn) {
             // Count the wake timeout from when the panel actually turns on, not from the request.
             wakeUntil = maxOf(wakeUntil, now + WAKE_LATENCY_MS + wakeTimeoutMs)
             notifyVisible(true)
-            Runtime.getRuntime().exec(arrayOf("input", "keyevent", "KEYCODE_WAKEUP"))
+            restoreBacklight()
             setPower(POWER_ON)
         } else {
             if (notifiedVisible != false) {
@@ -174,12 +269,27 @@ internal class DisplayController(thread: HandlerThread) : Handler(thread.looper)
             setPower(POWER_OFF)
         }
         applied = want
-        lastChangeAt = now
+        // setDisplayPowerMode blocks until the panel finishes (~0.5s for power-on); measure the gap
+        // from completion.
+        lastChangeAt = SystemClock.uptimeMillis()
         scheduleWakeExpiry(now)
     }
 
     private fun scheduleWakeExpiry(now: Long) {
         if (desiredOn()) postDelayed(reconcileRunnable, wakeUntil - now)
+    }
+
+    private fun isTrebleHooked(): Boolean {
+        if (trebleHooked) return true
+        trebleHooked = try {
+            val marker = File(TREBLE_HOOK_MARKER).takeIf { it.exists() }?.readText()?.trim()
+            marker != null && marker == File(BOOT_ID_PATH).readText().trim()
+        } catch (e: Exception) {
+            Log.w(TAG, "Couldn't read TrebleApp hook marker", e)
+            false
+        }
+        if (trebleHooked) Log.i(TAG, "TrebleApp lid handling disabled by hook; managing Android sleep/wake")
+        return trebleHooked
     }
 
     private fun setPower(mode: Int) {
@@ -190,6 +300,51 @@ internal class DisplayController(thread: HandlerThread) : Handler(thread.looper)
             Log.e(TAG, "SurfaceControl operation failed", e)
         } catch (e: SecurityException) {
             Log.e(TAG, "Permission denied", e)
+        }
+    }
+
+    private fun wakeUp() {
+        try {
+            wakeUpMethod.invoke(powerManager, SystemClock.uptimeMillis(), WAKE_REASON_APPLICATION,
+                "s22present:lid")
+            Log.v(TAG, "Android wakeUp")
+        } catch (e: Exception) {
+            Log.e(TAG, "wakeUp failed", e)
+        }
+    }
+
+    private fun goToSleep() {
+        try {
+            goToSleepMethod.invoke(powerManager, SystemClock.uptimeMillis())
+            Log.v(TAG, "Android goToSleep")
+        } catch (e: Exception) {
+            Log.e(TAG, "goToSleep failed", e)
+        }
+    }
+
+    // Backlight writes don't touch the SPI panel, so they're safe while a power change waits on the gap.
+    // Requires SELinux: allow magisk sysfs/sysfs_graphics file { open write }
+    // Called repeatedly while waiting: right after a wake Android hasn't set the brightness yet,
+    // and sets it shortly after, so a single write isn't enough.
+    private fun blankBacklight() {
+        try {
+            val current = File(SECONDARY_BACKLIGHT).readText().trim()
+            if (current == "0") return
+            File(SECONDARY_BACKLIGHT).writeText("0")
+            if (blankedBacklight == null) blankedBacklight = current
+            Log.v(TAG, "Secondary backlight blanked (was $current)")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to blank secondary backlight", e)
+        }
+    }
+
+    private fun restoreBacklight() {
+        val saved = blankedBacklight ?: return
+        blankedBacklight = null
+        try {
+            File(SECONDARY_BACKLIGHT).writeText(saved)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to restore secondary backlight", e)
         }
     }
 
