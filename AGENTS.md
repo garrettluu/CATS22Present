@@ -40,13 +40,14 @@ app/src/main/java/com/android/s22present/
   xposed/
     KeyguardDisplayHook.java   # Hooks SystemUI to prevent keyguard on secondary display
     KeyDebounceHook.java       # Hooks PhoneWindowManager.interceptKeyBeforeQueueing for key debounce
+    SecondaryDisplayHook.java  # Keeps Android from powering the outer panel on when it wakes with the lid open
     TrebleLidHook.java         # Disables TrebleApp's (GSI) built-in Cat S22 lid handling
 ```
 
 ### Xposed Integration
 
-- Three hooks registered in `resources/META-INF/xposed/java_init.list`
-- Scope: `com.android.systemui` + `android` (system server) + `me.phh.treble.app` (GSI TrebleApp) — see `scope.list`
+- Four hooks registered in `resources/META-INF/xposed/java_init.list`
+- Scope: `com.android.systemui` + `system` (system server; libxposed scope name, not `android`) + `me.phh.treble.app` (GSI TrebleApp) — see `scope.list`
 - TrebleApp's own lid handler sleeps/wakes Android and cuts secondary power on every hall event with no rate limit, which wedges the secondary panel's SPI bus. `TrebleLidHook` disables it and writes `<boot_id>` to `/data/user_de/0/me.phh.treble.app/files/s22present_lid_hook`; when that matches, `DisplayController` takes over Android sleep/wake
 - Uses libxposed API 101 (`compileOnly` dependency)
 - `KeyDebounceHook` reads debounce config via `getRemotePreferences("s22present_module")`

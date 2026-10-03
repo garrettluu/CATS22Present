@@ -79,6 +79,10 @@ internal class DisplayController(
         // isolation hides other apps' /data/user_de directories.
         private const val TREBLE_HOOK_MARKER =
             "/proc/1/root/data/user_de/0/me.phh.treble.app/files/s22present_lid_hook"
+        // Written by SecondaryDisplayHook (system_server).
+        private const val DISPLAY_HOOK_MARKER = "/proc/1/root/data/system/s22present_display_hook"
+        // Read by SecondaryDisplayHook to keep the outer panel off when Android wakes with the lid open.
+        private const val LID_OPEN_PROP = "sys.s22present.lid_open"
         private const val BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
         private const val WAKE_REASON_APPLICATION = 2
     }
@@ -93,6 +97,7 @@ internal class DisplayController(
     private var hallMissing = false
     private var openWakePending = false
     private var trebleHooked = false
+    private var displayHooked = false
     // Secondary backlight value saved while blanked; restored before the panel is shown again.
     private var blankedBacklight: String? = null
 
@@ -113,6 +118,10 @@ internal class DisplayController(
             "wakeUp", Long::class.javaPrimitiveType, Int::class.javaPrimitiveType, String::class.java
         )
     }
+    private val setPropMethod by lazy {
+        Class.forName("android.os.SystemProperties")
+            .getMethod("set", String::class.java, String::class.java)
+    }
 
     override fun handleMessage(msg: Message) {
         when (msg.what) {
@@ -121,7 +130,7 @@ internal class DisplayController(
                 if (msg.arg1 > 0) wakeTimeoutMs = msg.arg1.toLong()
                 notifiedVisible = null
                 Log.i(TAG, "Client registered, wakeTimeout=${wakeTimeoutMs}ms lidClosed=$lidClosed " +
-                    "trebleHooked=${isTrebleHooked()}")
+                    "trebleHooked=${isTrebleHooked()} displayHooked=${isDisplayHooked()}")
                 if (hallMissing) send(ScreenService.MSG_HALL_NOT_FOUND)
                 notifyVisible(desiredOn())
             }
@@ -139,6 +148,7 @@ internal class DisplayController(
     fun setInitialLid(closed: Boolean) = post {
         if (lidClosed == null) {
             lidClosed = closed
+            publishLid(closed)
             Log.i(TAG, "Initial lid state: closed=$closed")
         }
     }
@@ -147,6 +157,8 @@ internal class DisplayController(
         if (Looper.myLooper() != looper) { post { onLid(closed) }; return }
         if (lidClosed == closed) return
         lidClosed = closed
+        // Before anything below can wake Android, so SecondaryDisplayHook sees the new state.
+        publishLid(closed)
         val hooked = isTrebleHooked()
         Log.v(TAG, "Lid ${if (closed) "closed" else "open"} (trebleHooked=$hooked)")
         send(if (closed) ScreenService.MSG_LID_CLOSED else ScreenService.MSG_LID_OPEN)
@@ -173,6 +185,13 @@ internal class DisplayController(
 
     // Android changed the secondary's power itself (wake/sleep of the shared display group).
     private fun onAndroidSecondaryState(on: Boolean) {
+        if (on && lidClosed == false && isDisplayHooked()) {
+            // SecondaryDisplayHook kept the panel off; Android just believes it's on.
+            Log.v(TAG, "Android set secondary ON (kept off by display hook)")
+            applied = POWER_OFF
+            reconcile()
+            return
+        }
         Log.v(TAG, "Android set secondary ${if (on) "ON" else "OFF"}")
         val now = SystemClock.uptimeMillis()
         // Android sleeping while we're showing the secondary (power button, screen timeout)
@@ -205,8 +224,10 @@ internal class DisplayController(
             notifyVisible(wantOn)
             restoreBacklight()
             wakeUp()
-            applied = POWER_ON
-            lastChangeAt = now
+            if (lidClosed == true || !isDisplayHooked()) {
+                applied = POWER_ON
+                lastChangeAt = now
+            }
             postDelayed(reconcileRunnable, MIN_GAP_MS)
             return
         }
@@ -281,15 +302,32 @@ internal class DisplayController(
 
     private fun isTrebleHooked(): Boolean {
         if (trebleHooked) return true
-        trebleHooked = try {
-            val marker = File(TREBLE_HOOK_MARKER).takeIf { it.exists() }?.readText()?.trim()
-            marker != null && marker == File(BOOT_ID_PATH).readText().trim()
-        } catch (e: Exception) {
-            Log.w(TAG, "Couldn't read TrebleApp hook marker", e)
-            false
-        }
+        trebleHooked = markerMatchesBoot(TREBLE_HOOK_MARKER)
         if (trebleHooked) Log.i(TAG, "TrebleApp lid handling disabled by hook; managing Android sleep/wake")
         return trebleHooked
+    }
+
+    private fun isDisplayHooked(): Boolean {
+        if (displayHooked) return true
+        displayHooked = markerMatchesBoot(DISPLAY_HOOK_MARKER)
+        if (displayHooked) Log.i(TAG, "Display hook active; Android won't power the outer panel with the lid open")
+        return displayHooked
+    }
+
+    private fun markerMatchesBoot(path: String): Boolean = try {
+        val marker = File(path).takeIf { it.exists() }?.readText()?.trim()
+        marker != null && marker == File(BOOT_ID_PATH).readText().trim()
+    } catch (e: Exception) {
+        Log.w(TAG, "Couldn't read hook marker $path", e)
+        false
+    }
+
+    private fun publishLid(closed: Boolean) {
+        try {
+            setPropMethod.invoke(null, LID_OPEN_PROP, if (closed) "0" else "1")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to set $LID_OPEN_PROP", e)
+        }
     }
 
     private fun setPower(mode: Int) {
