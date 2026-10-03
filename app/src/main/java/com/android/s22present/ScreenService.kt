@@ -17,7 +17,6 @@ class ScreenService : RootService()
 {
     companion object {
         const val CMD_SECONDARY_OFF = 1
-        const val CMD_MAIN_OFF = 2
         const val CMD_SECONDARY_WAKE = 3
         const val CMD_START_HALL_MONITOR = 4
         const val CMD_MAIN_ON = 5
@@ -114,10 +113,6 @@ class ScreenService : RootService()
                     CMD_SECONDARY_OFF -> {
                         setDisplayPowerMode.invoke(null, Globals.token as IBinder?, powerModeOff)
                         Log.v("S22PresScreenServ", "Secondary display off")
-                    }
-                    CMD_MAIN_OFF -> {
-                        setDisplayPowerMode.invoke(null, Globals.token1 as IBinder?, powerModeOff)
-                        Log.v("S22PresScreenServ", "Main display off")
                     }
                     CMD_MAIN_ON -> {
                         setDisplayPowerMode.invoke(null, Globals.token1 as IBinder?, powerModeNormal)

@@ -209,18 +209,6 @@ class ListenerService : Service()
                             sendToRoot(request)
                         }, 500)
                 }
-                if(lid=="closed")
-                {
-                     if(display1.state== Display.STATE_ON)
-                    {
-                              val request = Message.obtain(null, ScreenService.CMD_MAIN_OFF, 0, 0)
-                              mainHandler.postDelayed(
-                        {
-                            Log.v("S22PresListServ", "Action requiring main screen off detected")
-                            sendToRoot(request)
-                        }, 100)
-                    }
-                }
             }
         }
         // Create a filter for the Broadcast Receiver
