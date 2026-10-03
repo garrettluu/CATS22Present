@@ -63,6 +63,8 @@ class Globals
         lateinit var visualsquare: SquareBarVisualizer
         var albumArtView: ImageView? = null
         var presentationRoot: View? = null
+        // Guards the lateinit views above; NotificationService can start before the presentation exists.
+        var presentationReady = false
         var style = 0
         var font = 0
         var wakeTimeoutMs = 3000L

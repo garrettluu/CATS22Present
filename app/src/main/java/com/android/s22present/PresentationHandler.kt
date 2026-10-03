@@ -168,7 +168,17 @@ class PresentationHandler(context: Context, display: Display?): Presentation(con
         {
             pixelfontset()
         }
+        Globals.presentationReady = true
         Log.i("S22PresHandlerInit", "Presentation displayed")
+    }
+
+    override fun onStop() {
+        Globals.presentationReady = false
+        Globals.albumArtView = null
+        Globals.presentationRoot = null
+        findViewById<BarVisualizer>(R.id.visualizerBar)?.release()
+        findViewById<SquareBarVisualizer>(R.id.visualizerSquare)?.release()
+        super.onStop()
     }
 }
 

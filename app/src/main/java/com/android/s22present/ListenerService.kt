@@ -47,6 +47,10 @@ class ListenerService : Service()
     private var lidClosedRunnable: Runnable? = null
     private var lidOpenRunnable: Runnable? = null
     private var mainDisplay: Display? = null
+    private var presentation: PresentationHandler? = null
+    private var screenReceiver: BroadcastReceiver? = null
+    private var proximityListener: SensorEventListener? = null
+    private var rootBound = false
     private val lidHandler = object : Handler(Looper.getMainLooper()) {
         override fun handleMessage(msg: Message) {
             when (msg.what) {
@@ -109,6 +113,7 @@ class ListenerService : Service()
         Log.i("S22PresListServInit", "Let's get the service for the screen running...")
         val intent = Intent(this, ScreenService::class.java)
         RootService.bind(intent, RootConnect)
+        rootBound = true
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int
     {
@@ -124,6 +129,10 @@ class ListenerService : Service()
             return START_NOT_STICKY
         }
 
+        if (presentation != null) {
+            Log.i("S22PresListServInit", "Already initialized, ignoring start")
+            return START_NOT_STICKY
+        }
         isRunning = true
         Log.i("S22PresListServInit", "Hello!")
         val displaymanager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
@@ -151,6 +160,7 @@ class ListenerService : Service()
         // Identify and show presentation.
         val present = PresentationHandler(this, display1)
         present.show()
+        presentation = present
         Globals.statusText?.text = "Running \u2713"
         // Bind to ScreenService.
         startscreenservice()
@@ -224,6 +234,7 @@ class ListenerService : Service()
         screenStateFilter.addAction(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
         // Start the Receiver with the filter we just created.
         registerReceiver(screenStateReciever, screenStateFilter, Context.RECEIVER_NOT_EXPORTED)
+        screenReceiver = screenStateReciever
         Log.i("S22PresListServInit", "Listening...")
         return START_NOT_STICKY
     }
@@ -268,7 +279,9 @@ class ListenerService : Service()
                 }
             }
         }
+        proximityListener?.let { sensorManager.unregisterListener(it) }
         sensorManager.registerListener(proximitySensorEventListener, proximitySensor, SensorManager.SENSOR_DELAY_FASTEST)
+        proximityListener = proximitySensorEventListener
         Log.i("S22PresListServInit", "Proximity sensor registered as lid fallback")
     }
 
@@ -288,6 +301,22 @@ class ListenerService : Service()
     }
     override fun onDestroy() {
         isRunning = false
+        wakeTimeoutHandler.removeCallbacksAndMessages(null)
+        mainHandler.removeCallbacksAndMessages(null)
+        lidHandler.removeCallbacksAndMessages(null)
+        screenReceiver?.let { unregisterReceiver(it) }
+        screenReceiver = null
+        proximityListener?.let {
+            (getSystemService(Context.SENSOR_SERVICE) as SensorManager).unregisterListener(it)
+        }
+        proximityListener = null
+        presentation?.dismiss()
+        presentation = null
+        if (rootBound) {
+            RootService.unbind(RootConnect)
+            rootBound = false
+        }
+        rootservice = null
         super.onDestroy()
     }
 }
@@ -381,6 +410,7 @@ class NotificationService : NotificationListenerService() {
 
     // When Notification created.
     override fun onNotificationPosted(sbn: StatusBarNotification) {
+        if (!Globals.presentationReady) return
         // Store information in variables
         val packageName = sbn.packageName
         val extras = sbn.notification.extras
@@ -425,6 +455,7 @@ class NotificationService : NotificationListenerService() {
         }
     }
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+        if (!Globals.presentationReady) return
         Log.v("S22PresNotifServ", "Something got removed. pkg=${sbn?.packageName}")
             val title = sbn?.notification?.extras?.getCharSequence("android.title")?.toString()
             val text = sbn?.notification?.extras?.getCharSequence("android.text")?.toString()
