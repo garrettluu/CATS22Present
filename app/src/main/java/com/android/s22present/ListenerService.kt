@@ -25,7 +25,6 @@ import android.os.Message
 import android.os.Messenger
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
-import android.telephony.TelephonyManager
 import android.util.Log
 import android.view.Display
 import android.view.View
@@ -33,35 +32,34 @@ import androidx.core.view.isInvisible
 import com.topjohnwu.superuser.ipc.RootService
 
 
-// This service listens for various things and tells the ScreenService what it should do.
-// These tasks have to be separated into two services since RootServices cannot do things that require context like register Broadcast receivers, but normal services can't do root things like turn the screen off.
+// Feeds inputs (wake requests, Android's view of the secondary display) to the root ScreenService,
+// which owns secondary display power, and applies its visibility decisions to the presentation.
 class ListenerService : Service()
 {
     companion object {
         var isRunning = false
-        private const val DISPLAY_WAKE_LATENCY_MS = 1000L
     }
     var rootservice: Messenger? = null
-    private var wakeSessionActive = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lidClosedRunnable: Runnable? = null
     private var lidOpenRunnable: Runnable? = null
     private var mainDisplay: Display? = null
+    private var secondaryDisplayId = Display.INVALID_DISPLAY
+    private var lastReportedSecondaryOn: Boolean? = null
     private var presentation: PresentationHandler? = null
     private var screenReceiver: BroadcastReceiver? = null
     private var proximityListener: SensorEventListener? = null
+    private var displayListenerRegistered = false
     private var rootBound = false
-    private val lidHandler = object : Handler(Looper.getMainLooper()) {
+    private val rootReplyHandler = object : Handler(Looper.getMainLooper()) {
         override fun handleMessage(msg: Message) {
             when (msg.what) {
-                ScreenService.MSG_LID_CLOSED -> {
-                    Log.v("S22PresListServ", "Hall sensor: lid closed")
-                    sendBroadcast(Intent("com.android.s22present.LIDCLOSED"))
+                ScreenService.MSG_SECONDARY_STATE -> {
+                    Globals.presentationRoot?.visibility =
+                        if (msg.arg1 == 1) View.VISIBLE else View.INVISIBLE
                 }
-                ScreenService.MSG_LID_OPEN -> {
-                    Log.v("S22PresListServ", "Hall sensor: lid open")
-                    sendBroadcast(Intent("com.android.s22present.LIDOPEN"))
-                }
+                ScreenService.MSG_LID_CLOSED -> Log.v("S22PresListServ", "Lid closed")
+                ScreenService.MSG_LID_OPEN -> Log.v("S22PresListServ", "Lid open")
                 ScreenService.MSG_HALL_NOT_FOUND -> {
                     Log.w("S22PresListServ", "No hall sensor, using proximity fallback")
                     mainDisplay?.let { registerProximitySensor(it) }
@@ -69,13 +67,13 @@ class ListenerService : Service()
             }
         }
     }
-    private val lidMessenger = Messenger(lidHandler)
-    private val wakeTimeoutHandler = Handler(Looper.getMainLooper())
-    private val wakeTimeoutRunnable = Runnable {
-        wakeSessionActive = false
-        Log.v("S22PresListServ", "Wake timeout, putting device to sleep")
-        Globals.presentationRoot?.visibility = View.INVISIBLE
-        sendToRoot(Message.obtain(null, ScreenService.CMD_SECONDARY_OFF, 0, 0))
+    private val rootReplyMessenger = Messenger(rootReplyHandler)
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId == secondaryDisplayId) reportSecondaryState()
+        }
     }
     val RootConnect = object : ServiceConnection
     {
@@ -83,21 +81,17 @@ class ListenerService : Service()
         {
             Log.i("S22PresScreenServInit", "Connecting...")
             rootservice = Messenger(service)
-            if(rootservice!=null)
-            {
-                        Globals.rootAvailable = true
-                        Globals.statusText?.text = "Running \u2713"
-                        Globals.onRootStatusChanged?.invoke()
-                        Log.i("S22PresScreenServInit", "Done!")
-                        val hallMsg = Message.obtain(null, ScreenService.CMD_START_HALL_MONITOR)
-                        hallMsg.replyTo = lidMessenger
-                        rootservice?.send(hallMsg)
-            } else {
-                Globals.rootAvailable = false
-                Globals.statusText?.text = "Not running \u2717"
-                Globals.onRootStatusChanged?.invoke()
-                Log.d("S22PresScreenServInit", "Failed!")
-            }
+            Globals.rootAvailable = true
+            Globals.statusText?.text = "Running ✓"
+            Globals.onRootStatusChanged?.invoke()
+            Log.i("S22PresScreenServInit", "Done!")
+            val register = Message.obtain(
+                null, ScreenService.CMD_REGISTER, Globals.wakeTimeoutMs.toInt(), 0
+            )
+            register.replyTo = rootReplyMessenger
+            sendToRoot(register)
+            lastReportedSecondaryOn = null
+            reportSecondaryState()
         }
         override fun onServiceDisconnected(name: ComponentName?)
         {
@@ -119,13 +113,7 @@ class ListenerService : Service()
     {
         if (intent?.action == WakeReceiver.ACTION_WAKE_DISPLAY) {
             Log.v("S22PresListServ", "Wake display requested")
-            wakeSessionActive = true
-            wakeTimeoutHandler.removeCallbacks(wakeTimeoutRunnable)
-            Globals.presentationRoot?.visibility = View.VISIBLE
-            sendToRoot(Message.obtain(null, ScreenService.CMD_SECONDARY_WAKE, 0, 0))
-            wakeTimeoutHandler.postDelayed(
-                wakeTimeoutRunnable, DISPLAY_WAKE_LATENCY_MS + Globals.wakeTimeoutMs
-            )
+            requestWake()
             return START_NOT_STICKY
         }
 
@@ -145,6 +133,7 @@ class ListenerService : Service()
             stopSelf()
             return START_NOT_STICKY
         }
+        secondaryDisplayId = display1.displayId
         Globals.migrateSettingsIfNeeded(this)
         try {
             val prefs = getSharedPreferences(Globals.PREFS_APP, Context.MODE_PRIVATE)
@@ -161,78 +150,25 @@ class ListenerService : Service()
         val present = PresentationHandler(this, display1)
         present.show()
         presentation = present
-        Globals.statusText?.text = "Running \u2713"
+        Globals.statusText?.text = "Running ✓"
         // Bind to ScreenService.
         startscreenservice()
-        // Create a BroadcastReceiver.
+        displaymanager.registerDisplayListener(displayListener, mainHandler)
+        displayListenerRegistered = true
         val screenStateReciever = object : BroadcastReceiver()
         {
-            var lid = "open"
             override fun onReceive(context: Context, intent: Intent)
             {
-                // When a Broadcast is Received.
-                if (intent.action == "com.android.s22present.LIDOPEN")
-                {
-                    lid = "open"
-                    wakeSessionActive = false
-                    wakeTimeoutHandler.removeCallbacks(wakeTimeoutRunnable)
-                    sendToRoot(Message.obtain(null, ScreenService.CMD_MAIN_ON, 0, 0))
-                    turnoff()
-                }
-                if (intent.action == "com.android.s22present.LIDCLOSED")
-                {
-                    lid = "closed"
-                    Log.v("S22PresListServ", "Lid closed, waking secondary briefly")
-                    wakeSessionActive = true
-                    wakeTimeoutHandler.removeCallbacks(wakeTimeoutRunnable)
-                    Globals.presentationRoot?.visibility = View.VISIBLE
-                    sendToRoot(Message.obtain(null, ScreenService.CMD_SECONDARY_WAKE, 0, 0))
-                    wakeTimeoutHandler.postDelayed(
-                        wakeTimeoutRunnable, DISPLAY_WAKE_LATENCY_MS + Globals.wakeTimeoutMs
-                    )
-                }
-                if (intent.action == "com.android.s22present.NOTIFICATION_RECEIVED" && lid == "closed")
-                {
-                    Log.v("S22PresListServ", "Notification received with lid closed, waking secondary")
-                    wakeSessionActive = true
-                    wakeTimeoutHandler.removeCallbacks(wakeTimeoutRunnable)
-                    Globals.presentationRoot?.visibility = View.VISIBLE
-                    sendToRoot(Message.obtain(null, ScreenService.CMD_SECONDARY_WAKE, 0, 0))
-                    wakeTimeoutHandler.postDelayed(
-                        wakeTimeoutRunnable, DISPLAY_WAKE_LATENCY_MS + Globals.wakeTimeoutMs
-                    )
-                }
-                if(intent.action == Intent.ACTION_SCREEN_ON && !wakeSessionActive)
-                {
-                      turnoff()
-                }
-            }
-            fun turnoff()
-            {
-                if(lid=="open")
-                {
-                    val request = Message.obtain(null, ScreenService.CMD_SECONDARY_OFF, 0, 0)
-                    mainHandler.postDelayed(
-                        {
-                            Log.v("S22PresListServ", "Action requiring screen off detected")
-                            Globals.presentationRoot?.visibility = View.INVISIBLE
-                            sendToRoot(request)
-                        }, 500)
+                when (intent.action) {
+                    "com.android.s22present.NOTIFICATION_RECEIVED" -> requestWake()
+                    Intent.ACTION_SCREEN_ON, Intent.ACTION_SCREEN_OFF -> reportSecondaryState()
                 }
             }
         }
-        // Create a filter for the Broadcast Receiver
         val screenStateFilter = IntentFilter()
-        // Add various actions to it.
         screenStateFilter.addAction(Intent.ACTION_SCREEN_ON)
-        screenStateFilter.addAction(Intent.ACTION_POWER_CONNECTED)
-        screenStateFilter.addAction(Intent.ACTION_POWER_DISCONNECTED)
+        screenStateFilter.addAction(Intent.ACTION_SCREEN_OFF)
         screenStateFilter.addAction("com.android.s22present.NOTIFICATION_RECEIVED")
-        screenStateFilter.addAction("com.android.s22present.NOTIFICATION_REMOVED")
-        screenStateFilter.addAction("com.android.s22present.LIDCLOSED")
-        screenStateFilter.addAction("com.android.s22present.LIDOPEN")
-        screenStateFilter.addAction(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
-        // Start the Receiver with the filter we just created.
         registerReceiver(screenStateReciever, screenStateFilter, Context.RECEIVER_NOT_EXPORTED)
         screenReceiver = screenStateReciever
         Log.i("S22PresListServInit", "Listening...")
@@ -242,6 +178,26 @@ class ListenerService : Service()
     override fun onBind(intent: Intent?): IBinder? {
       return null
     }
+
+    // The root service ignores this unless the lid is closed.
+    private fun requestWake() {
+        sendToRoot(Message.obtain(null, ScreenService.CMD_WAKE))
+    }
+
+    // Our own SurfaceControl calls don't change Display.state, so this only reports
+    // Android's power changes to the shared display group (wake/sleep).
+    private fun reportSecondaryState() {
+        val dm = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+        val on = dm.getDisplay(secondaryDisplayId)?.state == Display.STATE_ON
+        if (on == lastReportedSecondaryOn) return
+        lastReportedSecondaryOn = on
+        sendToRoot(Message.obtain(null, ScreenService.CMD_SECONDARY_OBSERVED, if (on) 1 else 0, 0))
+    }
+
+    private fun sendLid(closed: Boolean) {
+        sendToRoot(Message.obtain(null, ScreenService.CMD_LID, if (closed) 1 else 0, 0))
+    }
+
     private fun registerProximitySensor(display0: Display) {
         val sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         val proximitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
@@ -255,10 +211,7 @@ class ListenerService : Service()
                         val runnable = Runnable {
                             if (display0.state == Display.STATE_OFF) {
                                 Log.v("S22PresSensList", "Shut")
-                                Intent().also { broadcast ->
-                                    broadcast.setAction("com.android.s22present.LIDCLOSED")
-                                    sendBroadcast(broadcast)
-                                }
+                                sendLid(true)
                             }
                         }
                         lidClosedRunnable = runnable
@@ -267,10 +220,7 @@ class ListenerService : Service()
                         val runnable = Runnable {
                             if (display0.state == Display.STATE_ON) {
                                 Log.v("S22PresSensList", "Open")
-                                Intent().also { broadcast ->
-                                    broadcast.setAction("com.android.s22present.LIDOPEN")
-                                    sendBroadcast(broadcast)
-                                }
+                                sendLid(false)
                             }
                         }
                         lidOpenRunnable = runnable
@@ -301,9 +251,13 @@ class ListenerService : Service()
     }
     override fun onDestroy() {
         isRunning = false
-        wakeTimeoutHandler.removeCallbacksAndMessages(null)
         mainHandler.removeCallbacksAndMessages(null)
-        lidHandler.removeCallbacksAndMessages(null)
+        rootReplyHandler.removeCallbacksAndMessages(null)
+        if (displayListenerRegistered) {
+            (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
+                .unregisterDisplayListener(displayListener)
+            displayListenerRegistered = false
+        }
         screenReceiver?.let { unregisterReceiver(it) }
         screenReceiver = null
         proximityListener?.let {
