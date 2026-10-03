@@ -13,12 +13,12 @@ import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
 /**
- * Stops Android from powering the secondary (outer) panel on when it wakes with the lid open.
- * Waking powers the whole display group on, and S22Present would then have to power the outer
- * panel straight back off: a visible flash and an extra SPI power cycle. Only system_server's own
- * calls are affected; S22Present's root process controls the panel from its own process.
+ * Waking Android powers the whole display group on. This keeps the panel the lid hides off:
+ * the outer panel while the lid is open (avoiding a flash and an extra SPI power cycle), and the
+ * main panel while it's closed (brief wakes for the outer screen). Only system_server's own calls
+ * are affected; S22Present's root process controls the panels from its own process.
  */
-public class SecondaryDisplayHook extends XposedModule {
+public class LidDisplayHook extends XposedModule {
 
     private static final String TAG = "S22Present.DisplayHook";
     // Set by ScreenService's DisplayController before it wakes Android; "1" = open, "0" = closed.
@@ -34,7 +34,7 @@ public class SecondaryDisplayHook extends XposedModule {
     private static final int POWER_MODE_OFF = 0;
 
     private static Method getProp;
-    private static volatile IBinder secondaryToken;
+    private static final IBinder[] displayTokens = new IBinder[2];
     private static volatile boolean markerWritten;
     private static boolean inSystemServer;
     private static boolean installed;
@@ -115,34 +115,42 @@ public class SecondaryDisplayHook extends XposedModule {
             writeMarkerOnce();
             Object token = chain.getArg(0);
             int mode = (Integer) chain.getArg(1);
-            if (mode != POWER_MODE_OFF && token != null && isLidOpen() && token.equals(secondary())) {
-                Log.i(TAG, "Lid open: kept secondary panel off (mode " + mode + ")");
-                return null;
+            if (mode != POWER_MODE_OFF && token != null) {
+                String lid = lidOpenProp();
+                if ("1".equals(lid) && token.equals(displayToken(1))) {
+                    Log.i(TAG, "Lid open: kept secondary panel off (mode " + mode + ")");
+                    return null;
+                }
+                if ("0".equals(lid) && token.equals(displayToken(0))) {
+                    Log.i(TAG, "Lid closed: kept main panel off (mode " + mode + ")");
+                    return null;
+                }
             }
             return chain.proceed();
         }
 
-        private IBinder secondary() {
-            if (secondaryToken == null) {
+        // 0 = main, 1 = secondary, matching Globals.token1 / Globals.token.
+        private IBinder displayToken(int index) {
+            if (displayTokens[index] == null) {
                 try {
                     long[] ids = (long[]) surfaceControl.getMethod("getPhysicalDisplayIds").invoke(null);
-                    if (ids != null && ids.length > 1) {
-                        secondaryToken = (IBinder) surfaceControl
-                            .getMethod("getPhysicalDisplayToken", long.class).invoke(null, ids[1]);
+                    if (ids != null && ids.length > index) {
+                        displayTokens[index] = (IBinder) surfaceControl
+                            .getMethod("getPhysicalDisplayToken", long.class).invoke(null, ids[index]);
                     }
                 } catch (Throwable t) {
-                    Log.e(TAG, "Failed to get secondary display token", t);
+                    Log.e(TAG, "Failed to get display token " + index, t);
                 }
             }
-            return secondaryToken;
+            return displayTokens[index];
         }
     }
 
-    private static boolean isLidOpen() {
+    private static String lidOpenProp() {
         try {
-            return "1".equals(getProp.invoke(null, LID_OPEN_PROP, ""));
+            return (String) getProp.invoke(null, LID_OPEN_PROP, "");
         } catch (Throwable t) {
-            return false;
+            return "";
         }
     }
 

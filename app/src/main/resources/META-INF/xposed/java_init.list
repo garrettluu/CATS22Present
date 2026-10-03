@@ -1,4 +1,4 @@
 com.android.s22present.xposed.KeyguardDisplayHook
 com.android.s22present.xposed.KeyDebounceHook
 com.android.s22present.xposed.TrebleLidHook
-com.android.s22present.xposed.SecondaryDisplayHook
+com.android.s22present.xposed.LidDisplayHook

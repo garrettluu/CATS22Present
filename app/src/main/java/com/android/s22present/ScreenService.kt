@@ -79,9 +79,9 @@ internal class DisplayController(
         // isolation hides other apps' /data/user_de directories.
         private const val TREBLE_HOOK_MARKER =
             "/proc/1/root/data/user_de/0/me.phh.treble.app/files/s22present_lid_hook"
-        // Written by SecondaryDisplayHook (system_server).
+        // Written by LidDisplayHook (system_server).
         private const val DISPLAY_HOOK_MARKER = "/proc/1/root/data/system/s22present_display_hook"
-        // Read by SecondaryDisplayHook to keep the outer panel off when Android wakes with the lid open.
+        // Read by LidDisplayHook to keep the outer panel off when Android wakes with the lid open.
         private const val LID_OPEN_PROP = "sys.s22present.lid_open"
         private const val BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
         private const val WAKE_REASON_APPLICATION = 2
@@ -157,8 +157,15 @@ internal class DisplayController(
         if (Looper.myLooper() != looper) { post { onLid(closed) }; return }
         if (lidClosed == closed) return
         lidClosed = closed
-        // Before anything below can wake Android, so SecondaryDisplayHook sees the new state.
+        // Before anything below can wake Android, so LidDisplayHook sees the new state.
         publishLid(closed)
+        // The main panel isn't on the SPI bus, so it isn't rate-limited. While the lid is closed,
+        // LidDisplayHook keeps Android's own main power-ons from getting through; Android still
+        // believes main is on, so on open it won't re-request it and we power it on here.
+        if (powerManager.isInteractive) {
+            if (!closed) setMainPower(POWER_ON)
+            else if (isDisplayHooked()) setMainPower(POWER_OFF)
+        }
         val hooked = isTrebleHooked()
         Log.v(TAG, "Lid ${if (closed) "closed" else "open"} (trebleHooked=$hooked)")
         send(if (closed) ScreenService.MSG_LID_CLOSED else ScreenService.MSG_LID_OPEN)
@@ -186,7 +193,7 @@ internal class DisplayController(
     // Android changed the secondary's power itself (wake/sleep of the shared display group).
     private fun onAndroidSecondaryState(on: Boolean) {
         if (on && lidClosed == false && isDisplayHooked()) {
-            // SecondaryDisplayHook kept the panel off; Android just believes it's on.
+            // LidDisplayHook kept the panel off; Android just believes it's on.
             Log.v(TAG, "Android set secondary ON (kept off by display hook)")
             applied = POWER_OFF
             reconcile()
@@ -330,10 +337,14 @@ internal class DisplayController(
         }
     }
 
-    private fun setPower(mode: Int) {
+    private fun setPower(mode: Int) = setPowerFor(Globals.token, mode, "Secondary")
+
+    private fun setMainPower(mode: Int) = setPowerFor(Globals.token1, mode, "Main")
+
+    private fun setPowerFor(token: Any?, mode: Int, name: String) {
         try {
-            setDisplayPowerMode.invoke(null, Globals.token as IBinder?, mode)
-            Log.v(TAG, "Secondary power ${if (mode == POWER_ON) "ON" else "OFF"}")
+            setDisplayPowerMode.invoke(null, token as IBinder?, mode)
+            Log.v(TAG, "$name power ${if (mode == POWER_ON) "ON" else "OFF"}")
         } catch (e: ReflectiveOperationException) {
             Log.e(TAG, "SurfaceControl operation failed", e)
         } catch (e: SecurityException) {

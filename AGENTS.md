@@ -40,7 +40,7 @@ app/src/main/java/com/android/s22present/
   xposed/
     KeyguardDisplayHook.java   # Hooks SystemUI to prevent keyguard on secondary display
     KeyDebounceHook.java       # Hooks PhoneWindowManager.interceptKeyBeforeQueueing for key debounce
-    SecondaryDisplayHook.java  # Keeps Android from powering the outer panel on when it wakes with the lid open
+    LidDisplayHook.java        # Keeps Android from powering on the panel the lid hides (outer when open, main when closed)
     TrebleLidHook.java         # Disables TrebleApp's (GSI) built-in Cat S22 lid handling
 ```
 
